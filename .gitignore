@@ -1,0 +1,15 @@
+logs/
+*.egg*
+dist
+build
+__pycache__/
+.venv/
+.idea/
+.ruff_cache/
+.DS_Store
+*.log
+*.out
+*.err
+tags
+AUTHORS
+ChangeLog
