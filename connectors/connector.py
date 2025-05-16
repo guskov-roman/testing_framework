@@ -1,25 +1,16 @@
 import abc
-import collections
-import contextlib
 import copy
 import itertools
-import re
-import select
 import sys
-import termios
 import time
-import tty
 import typing
 
-ConIO = typing.TypeVar("ConIO", bound="ConnectorIO")
-
-class ConnectorException(Exception):
-    """Connector Exception """
-    pass
-
+# import errors
+from connectors import errors
+ConnectorException = errors.ConnectorError
+ConnectorClosedException = errors.ConnectorClosedError
 
 class ConnectorIO(typing.ContextManager):
-    # generic channel interface {{{
     @abc.abstractmethod
     def write(self, buf: bytes) -> int:
         pass
@@ -45,13 +36,13 @@ class ConnectorIO(typing.ContextManager):
     def update_pty(self, columns: int, lines: int) -> None:
         pass
 
-    def __enter__(self: ConIO) -> ConIO:
+    def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
-class ChannelBorrowed(ConnectorIO):  # pragma: no cover
+class ConnectorTaken(ConnectorIO):
     exception: typing.Type[Exception] = ConnectorException 
 
     def write(self, buf: bytes) -> int:
@@ -61,28 +52,17 @@ class ChannelBorrowed(ConnectorIO):  # pragma: no cover
         raise self.exception()
 
     def close(self) -> None:
-        raise self.exception()
+        pass        
 
     def fileno(self) -> int:
         raise self.exception()
 
     @property
     def closed(self) -> bool:
-        raise self.exception()
+        return True
 
     def update_pty(self, columns: int, lines: int) -> None:
         raise self.exception()
-
-class ChannelTaken(ChannelBorrowed):  # pragma: no cover
-    exception: typing.Type[Exception] = ConnectorException 
-
-    def close(self) -> None:
-        pass
-
-    @property
-    def closed(self) -> bool:
-        return True
-    
 
 class BoundedPattern:
     _length: int
@@ -101,12 +81,8 @@ class BoundedPattern:
         elif isinstance(width, tuple):
             self._length = width[1]
 
-        # It seems that when MAXREPEAT is not defined, the values 2**32-1 or
-        # 2**64-1 are used.  Let's be portable by just interpreting any value
-        # above 2**16-1 as an unbounded length.  Surely nobody wants to
-        # intentionally match 64 kiB patterns.......
         if self._length >= getattr(sre_parse, "MAXREPEAT", 2**16 - 1):
-            raise tbot.error.UnboundedPatternError(self.pattern.pattern)
+            raise ConnectorException(self.pattern.pattern)
 
     def __len__(self) -> int:
         return self._length
@@ -130,51 +106,36 @@ class ExpectResult(typing.NamedTuple):
 
 class Connector(typing.ContextManager):
 
+    _READ_SIZE = 4096
+
     def __init__(self, connector_io: ConnectorIO) -> None:
         self._c = connector_io
         self.prompt: typing.Optional[bytes] = None
-        # self.death_strings: typing.List[
-        #     typing.Tuple[
-        #         SearchString, typing.Type[DeathStringException], typing.Deque[int]
-        #     ]
-        # ] = []
-        # self._streams: typing.List[typing.TextIO] = []
-        # self._streambuf = bytearray()
-        self._log_prompt = True
         self._write_blacklist: typing.List[int] = []
-
         self.slow_send_delay: typing.Optional[float] = None
-        self.slow_send_chunksize: int = 32
-
-    # def load_config(self, name = "GenericConnector", config):
+        self.slow_send_chunksize: int = 32   
 
     def write(self, buf: bytes, _ignore_blacklist: bool = False) -> None:
         if not _ignore_blacklist:
             for blacklisted in self._write_blacklist:
                 if blacklisted in buf:
                     raise ConnectorException(
-                        f"attempted to write a forbidden byte ({chr(blacklisted)!r})"
+                        f"Attempted to write a forbidden byte ({chr(blacklisted)!r})"
                     )
 
         cursor = 0
         while cursor < len(buf):
             if self.slow_send_delay is None:
-                # write as much as possible
                 bytes_written = self._c.write(buf[cursor:])
             else:
-                # write at most `slow_send_chunksize` bytes
                 bytes_written = self._c.write(buf[cursor:][: self.slow_send_chunksize])
-                # and then wait for `slow_send_delay` before sending the next chunk
                 time.sleep(self.slow_send_delay)
             cursor += bytes_written
-
-    # Size of individual read calls.
-    READ_CHUNK_SIZE = 4096
 
     def read(self, n: int = -1, timeout: typing.Optional[float] = None) -> bytes:
         if n < 0:
             # Block first and then read non-blocking
-            buf = bytearray(self._c.read(self.READ_CHUNK_SIZE, timeout))
+            buf = bytearray(self._c.read(self._READ_SIZE, timeout))
             reader = self.read_iter(timeout=0.0)
         else:
             # Read n bytes non-blocking
@@ -186,8 +147,6 @@ class Connector(typing.ContextManager):
                 buf += chunk
         except TimeoutError:
             if n != -1:
-                # print("timeout Error")
-                # return bytes()
                 raise
 
         assert (n == -1) or (len(buf) == n)
@@ -207,11 +166,9 @@ class Connector(typing.ContextManager):
                     # print("Timeout Error")
                     raise TimeoutError()
 
-            max_read = min(self.READ_CHUNK_SIZE, max - bytes_read)
+            max_read = min(self._READ_SIZE, max - bytes_read)
             new = self._c.read(max_read, timeout_remaining)
             bytes_read += len(new)
-            # self._write_stream(new)
-            # self._check(new)
             yield new
 
             assert bytes_read <= max, "read overflow"
@@ -247,9 +204,8 @@ class Connector(typing.ContextManager):
                         .replace("\n\r", "\n")
                     )
 
-        raise RuntimeError("unreachable")  # pragma: no cover           
+        raise RuntimeError("unreachable")
 
-    # file-like interface {{{
     def fileno(self) -> int:
         return self._c.fileno()
 
@@ -260,15 +216,13 @@ class Connector(typing.ContextManager):
     def closed(self) -> bool:
          return self._c.closed
 
-    # context manager {{{
-    def __enter__(self) -> "Channel":
+    def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore
         if not self.closed:
             self.close()
 
-    # pexpect-like interface {{{
     def send(
         self,
         s: typing.Union[str, bytes],
@@ -276,7 +230,6 @@ class Connector(typing.ContextManager):
         timeout: typing.Optional[float] = None,
         _ignore_blacklist: bool = False,
     ) -> None:
-        # Do nothing for empty strings
         if s == "" or s == b"":
             return
 
@@ -334,9 +287,6 @@ class Connector(typing.ContextManager):
             end = lineending.encode("utf-8")
         else:
             end = lineending
-
-        # This implementation is quite naive but any
-        # other way would possibly read too much :/
 
         start_time = time.monotonic()
         line = bytearray()
@@ -417,96 +367,7 @@ class Connector(typing.ContextManager):
 
     def take(self) -> "Connector":
         con_io = self._c
-        self._c = ChannelTaken()
+        self._c = ConnectorTaken() 
         new = copy.deepcopy(self)
         new._c = con_io
-        return new
-
-    def attach_interactive(
-        self, end_magic: typing.Union[str, bytes, None] = None, ctrld_exit: bool = False
-    ) -> None:
-        end_magic_bytes = (
-            end_magic.encode("utf-8") if isinstance(end_magic, str) else end_magic
-        )
-
-        end_ring_buffer: typing.Deque[int] = collections.deque(
-            maxlen=len(end_magic_bytes) if end_magic_bytes is not None else 1
-        )
-
-        # During an interactive session, the blacklist should not apply
-        old_blacklist = self._write_blacklist
-        self._write_blacklist = []
-
-        escape_timestamp = None
-        previous: typing.Deque[int] = collections.deque(maxlen=3)
-
-        if not ctrld_exit:
-            print("Press CTRL+] three times within 1 second to exit.")
-            # tbot.log.message(
-            #     tbot.log.c("Press CTRL+] three times within 1 second to exit.").bold
-            # )
-
-        oldtty = termios.tcgetattr(sys.stdin)
-        try:
-            tty.setraw(sys.stdin.fileno())
-            tty.setcbreak(sys.stdin.fileno())
-
-            mode = termios.tcgetattr(sys.stdin)
-            special_chars = mode[6]
-            assert isinstance(special_chars, list)
-            special_chars[termios.VMIN] = b"\0"
-            special_chars[termios.VTIME] = b"\0"
-            termios.tcsetattr(sys.stdin, termios.TCSAFLUSH, mode)
-
-            while True:
-                r, _, _ = select.select([self, sys.stdin], [], [])
-
-                if self in r:
-                    data = self._c.read(4096)
-                    if isinstance(end_magic_bytes, bytes):
-                        end_ring_buffer.extend(data)
-                        for a, b in itertools.zip_longest(
-                            end_ring_buffer, end_magic_bytes
-                        ):
-                            if a != b:
-                                # print("break 1")
-                                break
-                        else:
-                            # print("break 2")
-                            break
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.buffer.flush()
-                if sys.stdin in r:
-                    data = sys.stdin.buffer.read(4096)
-                    previous.extend(data)
-
-                    # Old ^D to exit behavior
-                    if ctrld_exit and data == b"\x04":
-                        break
-
-                    # Detect whether ^] was pressed 3 times in 1 second
-                    now = time.monotonic()
-                    if escape_timestamp is None and 0x1D in previous:
-                        escape_timestamp = now
-                    elif escape_timestamp is not None:
-                        if now < escape_timestamp + 1:
-                            if previous.count(0x1D) >= 3:
-                                print("break 3")
-                                break
-                        else:
-                            escape_timestamp = None
-
-                    self.send(data)
-
-            sys.stdout.write("\r\n")
-        finally:
-            self._write_blacklist = old_blacklist
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, oldtty)
-
-    # }}}
-
-    # pexpect-like }}}
-
-# res = ExpectResult(0, "first", "string", "after")
-
-# print(type(res))
+        return new   

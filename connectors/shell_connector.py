@@ -13,15 +13,15 @@ import shutil
 import typing
 import abc
 
-# import tbot.error
+from connectors import errors
+from connectors import connector
 
-import Connector 
+ConnectorException = errors.ConnectorError
+ConnectorClosedException = errors.ConnectorClosedError
 
-READ_CHUNK_SIZE = 4096
-MIN_READ_WAIT = 0.3
+class ShellConnectorIO(connector.ConnectorIO):
 
-
-class ShellConnectorIO(Connector.ConnectorIO):
+    _MIN_READ_WAIT = 0.3
 
     def __init__(self) -> None:
         self.pty_master, self.pty_slave = pty.openpty()
@@ -40,7 +40,7 @@ class ShellConnectorIO(Connector.ConnectorIO):
 
     def write(self, buf: bytes) -> int:
         if self.closed:
-            raise BaseConnector.ConnectorException
+            raise ConnectorException
         
         _, w, _ = select.select([], [self.pty_master], [], 10.0)
         if self.pty_master not in w:
@@ -48,7 +48,7 @@ class ShellConnectorIO(Connector.ConnectorIO):
 
         bytes_written = os.write(self.pty_master, buf)
         if bytes_written == 0:
-            raise Connector.ConnectorException
+            raise ConnectorException 
         return bytes_written
 
     def read(self, n: int, timeout: typing.Optional[float] = None) -> bytes:
@@ -57,9 +57,9 @@ class ShellConnectorIO(Connector.ConnectorIO):
             end_time = None if timeout is None else time.monotonic() + timeout
             while True:
                 if end_time is None:
-                    select_timeout = MIN_READ_WAIT
+                    select_timeout = self._MIN_READ_WAIT
                 else:
-                    select_timeout = min(MIN_READ_WAIT, end_time - time.monotonic())
+                    select_timeout = min(self._MIN_READ_WAIT, end_time - time.monotonic())
                     if select_timeout <= 0:
                         raise TimeoutError()
 
@@ -70,19 +70,15 @@ class ShellConnectorIO(Connector.ConnectorIO):
                     break
                 elif self.closed:
                     # Nothing to read and channel is closed.  We're done for good.
-                    raise BaseConnector.ConnectorException
-
-                # Loop back around and try again until timeout expires.
-
+                    raise ConnectorException
         try:
-            # return channel._debug_log(self, os.read(self.pty_master, n))
             return os.read(self.pty_master, n)
         except (BlockingIOError, OSError):
-            raise BaseConnector.ConnectorException
+            raise ConnectorException
 
     def close(self) -> None:
         if self.closed:
-            raise tbot.error.ChannelClosedError
+            raise ConnectorClosedException
 
         sid = os.getsid(self.p.pid)
         self.p.terminate()
@@ -123,7 +119,7 @@ class ShellConnectorIO(Connector.ConnectorIO):
             time.sleep(wait_time)
             wait_total += wait_time
         else:
-            raise BaseConnector.ConnectorException("some subprocess(es) did not stop")
+            raise ConnectorException("some subprocess(es) did not stop")
 
     def fileno(self) -> int:
         return self.pty_master
@@ -137,20 +133,35 @@ class ShellConnectorIO(Connector.ConnectorIO):
         s = struct.pack("HHHH", lines, columns, 0, 0)
         fcntl.ioctl(self.pty_master, termios.TIOCSWINSZ, s, False)
 
-BTR_PROMPT = b"BTR-VEJPVC1QUk9NUFQK$ "
+class ShellConnector(connector.Connector):
 
-class ShellConnector(Connector.Connector):
     def __init__(self) -> None:
         super().__init__(ShellConnectorIO())
-        self.name = "PtyConnector"
+        self.name = "ShellConnector"
+        self.prompt = b"BTR-VEJPVC1QUk9NUFQK$ "
+
+        self._write_blacklist = [
+                0x03,  # ETX  | End of Text / Interrupt
+                0x04,  # EOT  | End of Transmission
+                0x11,  # DC1  | Device Control One (XON)
+                0x12,  # DC2  | Device Control Two
+                0x13,  # DC3  | Device Control Three (XOFF)
+                0x14,  # DC4  | Device Control Four
+                0x15,  # NAK  | Negative Acknowledge
+                0x16,  # SYN  | Synchronous Idle
+                0x17,  # ETB  | End of Transmission Block
+                0x1A,  # SUB  | Substitute / Suspend Process
+                0x1C,  # FS   | File Separator
+                0x7F,  # DEL  | Delete               
+        ]
+
         self.sendline(
             b"PROMPT_COMMAND=''; PS1='"
-            + BTR_PROMPT[:6]
+            + self.prompt[:6]
             + b"''"
-            + BTR_PROMPT[6:]
+            + self.prompt[6:]
             + b"'",
         )
-        self.prompt = BTR_PROMPT
         self.read_until_prompt()
 
         self.sendline("unset HISTFILE")
@@ -188,7 +199,7 @@ class ShellConnector(Connector.Connector):
         retcode = self._posix_fetch_return_code()
         return (retcode, out)
 
-    def open_channel(self, cmd):
+    def open_interactive(self, cmd):
         self.sendline("stty -isig", read_back=True)
         self.read_until_prompt()
         self.sendline(cmd + "; exit", read_back=True)
@@ -209,95 +220,3 @@ class ShellConnector(Connector.Connector):
                 raise TypeError(f"{type(arg)!r} is not a supported argument type!")
 
         return " ".join(string_args)   
-
-    def interactive(self) -> None:
-        # Generate the endstring instead of having it as a constant
-        # so opening this files won't trigger an exit
-        endstr = (
-            "INTERACTIVE-END-"
-            + hex(165_380_656_580_165_943_945_649_390_069_628_824_191)[2:]
-        )
-
-        termsize = shutil.get_terminal_size()
-        self.sendline(self.escape("stty", "cols", str(termsize.columns)))
-        self.sendline(self.escape("stty", "rows", str(termsize.lines)))
-
-        # Outer shell which is used to detect the end of the interactive session
-        self.sendline(f"bash --norc --noprofile")
-        self.sendline(f"PS1={endstr}")
-        self.read_until_prompt(prompt=endstr)
-
-        # Inner shell which will be used by the user
-        self.sendline("bash --norc --noprofile")
-        self.sendline("set -o emacs")
-        prompt = self.escape(
-            f"\\[\\033[36m\\]{self.name}: \\[\\033[32m\\]\\w\\[\\033[0m\\]> "
-        )
-        self.sendline(f"PS1={prompt}")
-
-        self.read_until_prompt(prompt=re.compile(b"> (\x1B\\[.{0,10})?"))
-        self.sendline()
-        # tbot.log.message("Entering interactive shell ...")
-        print("Entering interactive shell ...")
-
-        self.attach_interactive(end_magic=endstr)
-
-        print("Exiting interactive shell ...")
-
-        try:
-            self.sendline("exit")
-            try:
-                self.read_until_prompt(timeout=0.5)
-            except TimeoutError:
-                # we might still be in the inner shell so let's try exiting again
-                self.sendline("exit")
-                self.read_until_prompt(timeout=0.5)
-        except TimeoutError:
-            raise Exception("Failed to reacquire shell after interactive session!")   
-
-
-
-# with ShellConnector() as c:
-#     c.sendline("ls /etc", read_back=True)
-#     out = c.read_until_prompt()
-#     print(out)
-
-    # out = c.read_until_prompt()
-    # print(out)
-# print(f"ord: {ord('A')}")
-# print("exit")
-con = ShellConnector()
-
-# # print("start mc")
-with con.open_channel("mc") as mc:
-    # mc.write(bytes([121]), _ignore_blacklist=True)
-    output = None
-    while True:
-        try:
-            out = mc.readline(0.3) 
-            print(out, end="")
-            # output = output + out
-        except:
-            break
-
-#     print(output)
-    # out = mc.read(256)
-    # print(out)
-    # print("*****************************************************************************************************")
-    # mc.sendline("ls /etc")
-    # out = mc.expect("Hint: Want your plain")
-    # out = mc.expect("fdsfsdfsdf", 0.3)
-    # print(out)
-
-#     mc.sendcontrol("C")    
-#     print("send succsess")
-#     out = mc.read(256)
-#     print(f"read: {out}")
-#     # out = mc.read_until_prompt()
-#     # print("out: {out}")
-# print("wait for end")
-# out = con.exec("mc")
-# print(f"out: {out}")
-
-# con.close()
-
