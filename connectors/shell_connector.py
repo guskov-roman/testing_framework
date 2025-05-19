@@ -25,6 +25,7 @@ class ShellConnectorIO(connector.ConnectorIO):
 
     def __init__(self) -> None:
         self.pty_master, self.pty_slave = pty.openpty()
+        self.log = None
 
         self.p = subprocess.Popen(
             ["bash", "--norc", "--noprofile", "--noediting", "-i"],

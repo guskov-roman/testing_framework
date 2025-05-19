@@ -113,7 +113,34 @@ class Connector(typing.ContextManager):
         self.prompt: typing.Optional[bytes] = None
         self._write_blacklist: typing.List[int] = []
         self.slow_send_delay: typing.Optional[float] = None
-        self.slow_send_chunksize: int = 32   
+        self.slow_send_chunksize: int = 32
+        self._incoming_buf = bytearray()
+        self._connector_buf = bytearray()
+        self._connector_log = None
+
+    @property
+    def connectorBuffer(self):
+        return self._connector_buf
+
+    @property
+    def log(self):
+        return self._connector_log
+
+    @log.setter
+    def log(self, file_name):
+        if self._connector_log is not None:
+            self._connector_log.close()
+
+        self._connector_log = open(file_name, 'w')
+        self._connector_log.seek(0)
+        self._connector_log.truncate()
+
+    def _write_log(self, buf: bytes):
+        if self._connector_log is None:
+            return
+        self._connector_log.write(
+                buf.decode(encoding='latin-1', errors='replace')
+                )
 
     def write(self, buf: bytes, _ignore_blacklist: bool = False) -> None:
         if not _ignore_blacklist:
@@ -136,6 +163,8 @@ class Connector(typing.ContextManager):
         if n < 0:
             # Block first and then read non-blocking
             buf = bytearray(self._c.read(self._READ_SIZE, timeout))
+            self._connector_buf += buf
+            self._write_log(buf)
             reader = self.read_iter(timeout=0.0)
         else:
             # Read n bytes non-blocking
@@ -163,12 +192,13 @@ class Connector(typing.ContextManager):
             if timeout is not None:
                 timeout_remaining = timeout - (time.monotonic() - start_time)
                 if timeout_remaining <= 0:
-                    # print("Timeout Error")
                     raise TimeoutError()
 
             max_read = min(self._READ_SIZE, max - bytes_read)
             new = self._c.read(max_read, timeout_remaining)
             bytes_read += len(new)
+            self._connector_buf += bytearray(new)
+            self._write_log(new)
             yield new
 
             assert bytes_read <= max, "read overflow"
@@ -302,15 +332,13 @@ class Connector(typing.ContextManager):
             if line.endswith(end):
                 break
 
-        # print(f"read line: {line} ")
-
         return (
             line.decode("utf-8", errors="replace")
             .replace("\r\n", "\n")
             .replace("\n\r", "\n")
         )
 
-    def expect(
+    def expect0(
         self,
         patterns: typing.Union[
             ConvenientSearchString, typing.List[ConvenientSearchString]
