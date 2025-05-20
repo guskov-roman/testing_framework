@@ -5,7 +5,6 @@ import sys
 import time
 import typing
 
-# import errors
 from connectors import errors
 ConnectorException = errors.ConnectorError
 ConnectorClosedException = errors.ConnectorClosedError
@@ -142,7 +141,7 @@ class Connector(typing.ContextManager):
                 buf.decode(encoding='latin-1', errors='replace')
                 )
 
-    def write(self, buf: bytes, _ignore_blacklist: bool = False) -> None:
+    def write(self, buf: bytes, _ignore_blacklist: bool = False) -> int:
         if not _ignore_blacklist:
             for blacklisted in self._write_blacklist:
                 if blacklisted in buf:
@@ -158,6 +157,8 @@ class Connector(typing.ContextManager):
                 bytes_written = self._c.write(buf[cursor:][: self.slow_send_chunksize])
                 time.sleep(self.slow_send_delay)
             cursor += bytes_written
+        return cursor
+        
 
     def read(self, n: int = -1, timeout: typing.Optional[float] = None) -> bytes:
         if n < 0:
@@ -176,7 +177,7 @@ class Connector(typing.ContextManager):
                 buf += chunk
         except TimeoutError:
             if n != -1:
-                raise
+                return bytes() 
 
         assert (n == -1) or (len(buf) == n)
         return buf
@@ -259,9 +260,9 @@ class Connector(typing.ContextManager):
         read_back: bool = False,
         timeout: typing.Optional[float] = None,
         _ignore_blacklist: bool = False,
-    ) -> None:
+    ) -> bool:
         if s == "" or s == b"":
-            return
+            return False
 
         s = s.encode("utf-8") if isinstance(s, str) else s
 
@@ -280,8 +281,9 @@ class Connector(typing.ContextManager):
                 # be flawed in some cases, though ...
                 length = len(chunk) + chunk.count(b"\r") + chunk.count(b"\n")
                 self.read(n=length, timeout=timeout)
+        return True
 
-    def sendline(
+    def send_line(
         self,
         s: typing.Union[str, bytes] = "",
         read_back: bool = False,
@@ -291,11 +293,10 @@ class Connector(typing.ContextManager):
         # The "Enter" key sends '\r'
         self.send(s + b"\r", read_back, timeout)
 
-    def sendcontrol(self, c: str) -> None:
+    def send_control(self, c: str) -> None:
         assert len(c) == 1, "Only a single character is allowed for sendcontrol()"
 
         num = ord(c) - 64
-        print(f"send num {num}")
         assert 0 <= num <= 0x1F, f"Character {c!r} does not represent a control char!"
 
         self.write(bytes([num]), _ignore_blacklist=True)
@@ -307,7 +308,7 @@ class Connector(typing.ContextManager):
         """Send ``CTRL-C`` to this channel."""
         self.sendcontrol("C")
 
-    def readline(
+    def read_line(
         self,
         timeout: typing.Optional[float] = None,
         lineending: typing.Union[str, bytes] = "\r\n",

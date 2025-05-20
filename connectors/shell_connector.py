@@ -7,11 +7,8 @@ import subprocess
 import termios
 import time
 import typing
-import re
 import shlex
 import shutil
-import typing
-import abc
 
 from connectors import errors
 from connectors import connector
@@ -41,7 +38,7 @@ class ShellConnectorIO(connector.ConnectorIO):
 
     def write(self, buf: bytes) -> int:
         if self.closed:
-            raise ConnectorException
+            raise ConnectorClosedException
         
         _, w, _ = select.select([], [self.pty_master], [], 10.0)
         if self.pty_master not in w:
@@ -49,7 +46,7 @@ class ShellConnectorIO(connector.ConnectorIO):
 
         bytes_written = os.write(self.pty_master, buf)
         if bytes_written == 0:
-            raise ConnectorException 
+            raise ConnectorClosedException 
         return bytes_written
 
     def read(self, n: int, timeout: typing.Optional[float] = None) -> bytes:
@@ -71,11 +68,11 @@ class ShellConnectorIO(connector.ConnectorIO):
                     break
                 elif self.closed:
                     # Nothing to read and channel is closed.  We're done for good.
-                    raise ConnectorException
+                    raise ConnectorClosedException
         try:
             return os.read(self.pty_master, n)
         except (BlockingIOError, OSError):
-            raise ConnectorException
+            raise ConnectorClosedException
 
     def close(self) -> None:
         if self.closed:
@@ -156,7 +153,7 @@ class ShellConnector(connector.Connector):
                 0x7F,  # DEL  | Delete               
         ]
 
-        self.sendline(
+        self.send_line(
             b"PROMPT_COMMAND=''; PS1='"
             + self.prompt[:6]
             + b"''"
@@ -165,29 +162,29 @@ class ShellConnector(connector.Connector):
         )
         self.read_until_prompt()
 
-        self.sendline("unset HISTFILE")
+        self.send_line("unset HISTFILE")
         self.read_until_prompt()
 
         # Disable line editing
-        self.sendline("set +o emacs; set +o vi")
+        self.send_line("set +o emacs; set +o vi")
         self.read_until_prompt()
 
         # Set secondary prompt to ""
-        self.sendline("PS2=''")
+        self.send_line("PS2=''")
         self.read_until_prompt()
 
-        self.sendline("histchars=''")
+        self.send_line("histchars=''")
         self.read_until_prompt()       
 
         # Set terminal size
         termsize = shutil.get_terminal_size()
-        self.sendline(f"stty cols {max(80, termsize.columns - 48)}")
+        self.send_line(f"stty cols {max(80, termsize.columns - 48)}")
         self.read_until_prompt()
-        self.sendline(f"stty rows {termsize.lines}")
+        self.send_line(f"stty rows {termsize.lines}")
         self.read_until_prompt()
 
     def _posix_fetch_return_code(self) -> int:
-        self.sendline("echo $?", read_back=True)
+        self.send_line("echo $?", read_back=True)
         retcode_str = self.read_until_prompt()
         try:
             return int(retcode_str)
@@ -195,15 +192,15 @@ class ShellConnector(connector.Connector):
             raise tbot.error.InvalidRetcodeError(mach, retcode_str) from None
 
     def exec(self, cmd) -> typing.Tuple[int, str]:
-        self.sendline(cmd, read_back=True)
+        self.send_line(cmd, read_back=True)
         out = self.read_until_prompt()
         retcode = self._posix_fetch_return_code()
         return (retcode, out)
 
     def open_interactive(self, cmd):
-        self.sendline("stty -isig", read_back=True)
+        self.send_line("stty -isig", read_back=True)
         self.read_until_prompt()
-        self.sendline(cmd + "; exit", read_back=True)
+        self.send_line(cmd + "; exit", read_back=True)
         return self.take()
 
     def escape(
