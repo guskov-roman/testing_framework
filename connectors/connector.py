@@ -116,9 +116,10 @@ class Connector(typing.ContextManager):
         self._incoming_buf = bytearray()
         self._connector_buf = bytearray()
         self._connector_log = None
+        self._capture_out = None
 
     @property
-    def connectorBuffer(self):
+    def connector_buffer(self):
         return self._connector_buf
 
     @property
@@ -127,6 +128,7 @@ class Connector(typing.ContextManager):
 
     @log.setter
     def log(self, file_name):
+
         if self._connector_log is not None:
             self._connector_log.close()
 
@@ -134,12 +136,15 @@ class Connector(typing.ContextManager):
         self._connector_log.seek(0)
         self._connector_log.truncate()
 
-    def _write_log(self, buf: bytes):
-        if self._connector_log is None:
-            return
-        self._connector_log.write(
-                buf.decode(encoding='latin-1', errors='replace')
-                )
+    def _write_out(self, buf: bytes):
+        if self._connector_log is not None:
+            self._connector_log.write(
+                    buf.decode(encoding='latin-1', errors='replace')
+                    )
+        if self._capture_out is not None:
+            self._capture_out.write(
+                    buf.decode(encoding='latin-1', errors='replace')
+                    )
 
     def write(self, buf: bytes, _ignore_blacklist: bool = False) -> int:
         if not _ignore_blacklist:
@@ -165,7 +170,7 @@ class Connector(typing.ContextManager):
             # Block first and then read non-blocking
             buf = bytearray(self._c.read(self._READ_SIZE, timeout))
             self._connector_buf += buf
-            self._write_log(buf)
+            self._write_out(buf)
             reader = self.read_iter(timeout=0.0)
         else:
             # Read n bytes non-blocking
@@ -177,7 +182,7 @@ class Connector(typing.ContextManager):
                 buf += chunk
         except TimeoutError:
             if n != -1:
-                return bytes() 
+                raise
 
         assert (n == -1) or (len(buf) == n)
         return buf
@@ -199,7 +204,7 @@ class Connector(typing.ContextManager):
             new = self._c.read(max_read, timeout_remaining)
             bytes_read += len(new)
             self._connector_buf += bytearray(new)
-            self._write_log(new)
+            self._write_out(new)
             yield new
 
             assert bytes_read <= max, "read overflow"
@@ -301,10 +306,10 @@ class Connector(typing.ContextManager):
 
         self.write(bytes([num]), _ignore_blacklist=True)
 
-    def sendeof(self) -> None:
+    def send_eof(self) -> None:
         raise NotImplementedError()
 
-    def sendintr(self) -> None:
+    def send_intr(self) -> None:
         """Send ``CTRL-C`` to this channel."""
         self.sendcontrol("C")
 
@@ -338,6 +343,19 @@ class Connector(typing.ContextManager):
             .replace("\r\n", "\n")
             .replace("\n\r", "\n")
         )
+
+    def expect(
+        self,
+        patterns: typing.Union[
+            ConvenientSearchString, typing.List[ConvenientSearchString]
+        ],
+        timeout: typing.Optional[float] = None,
+    ) -> bool:
+        try:
+            ret = self.expect0(patterns, timeout)
+            return (ret.i >= 0)
+        except TimeoutError:
+            return False
 
     def expect0(
         self,

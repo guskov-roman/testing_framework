@@ -191,10 +191,13 @@ class ShellConnector(connector.Connector):
         except ValueError:
             raise tbot.error.InvalidRetcodeError(mach, retcode_str) from None
 
-    def exec(self, cmd) -> typing.Tuple[int, str]:
+    def exec(self, cmd, **kwargs: typing.Any) -> typing.Tuple[int, str]:
+        if kwargs.get('out'):
+            self._capture_out = kwargs['out']
         self.send_line(cmd, read_back=True)
         out = self.read_until_prompt()
         retcode = self._posix_fetch_return_code()
+        self._capture_out = None
         return (retcode, out)
 
     def open_interactive(self, cmd):
